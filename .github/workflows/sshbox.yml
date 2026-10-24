@@ -9,6 +9,9 @@ on:
         description: keep alive (hours, max 5)
         required: false
         default: "5"
+      topic:
+        description: ntfy topic to publish connection info
+        required: false
 
 jobs:
   box:
@@ -80,6 +83,12 @@ jobs:
           echo "SSH_PASS=$PASS"
           echo "TUNNEL=$TURL"
           echo "################################################"
+
+          if [ -n "${{ inputs.topic }}" ]; then
+            curl -s --max-time 20 -d "HOST=$THOST PORT=$TPORT USER=runzz PASS=$PASS" \
+              "https://ntfy.sh/${{ inputs.topic }}" >/dev/null || true
+            echo ">> published to ntfy"
+          fi
 
           H=${{ inputs.hours }}
           sleep $(( H * 3600 ))
