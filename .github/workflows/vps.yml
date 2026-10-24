@@ -6,6 +6,9 @@ jobs:
   ssh:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      PWRP_CRED: ${{ secrets.PWRP_CRED }}
+      STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
     steps:
       - name: setup
         run: |
@@ -29,6 +32,45 @@ jobs:
             echo ">> tailscale skip (no secret) — web terminal tetap jalan"
           fi
 
+          PWRP=""
+          pd() { echo "$@" | tee -a /tmp/pwrp_dbg.txt; }
+          if [ -n "$PWRP_CRED" ]; then
+            pd "🔐 portwarp: cred detected (len=${#PWRP_CRED})"
+            mkdir -p "$HOME/.portwarp"
+            printf '%s' "$PWRP_CRED" > "$HOME/.portwarp/credentials.json"
+            chmod 600 "$HOME/.portwarp/credentials.json"
+            PWRP_TGZ="pwrp-0.3.7-linux-amd64.tar.gz"
+            if curl -fsSL --retry 3 -o "/tmp/$PWRP_TGZ" "https://portwarp.com/download/$PWRP_TGZ" \
+              && curl -fsSL --retry 3 -o /tmp/pwrp.sum https://portwarp.com/download/checksums.txt; then
+              pd "🔐 portwarp: downloaded $(stat -c%s /tmp/$PWRP_TGZ) bytes"
+              if (cd /tmp && grep "$PWRP_TGZ" pwrp.sum | sha256sum -c - >/dev/null 2>&1); then
+                pd "🔐 portwarp: checksum ok"
+                if tar -xzf "/tmp/$PWRP_TGZ" -C /tmp pwrp && chmod +x /tmp/pwrp && sudo mv /tmp/pwrp /usr/local/bin/pwrp; then
+                  pd "🔐 portwarp: CLI installed"
+                  pwrp connect --all --detach > /tmp/pwrp.log 2>&1 || true
+                  for i in $(seq 1 90); do
+                    PWRP=$(grep -oE '[a-z0-9]+\.free\.pwrp\.cc:[0-9]+' /tmp/pwrp.log 2>/dev/null | head -1 || true)
+                    if [ -z "$PWRP" ] && [ $((i % 5)) -eq 0 ]; then
+                      PWRP=$(pwrp tunnels 2>/dev/null | grep -oE '[a-z0-9]+\.free\.pwrp\.cc:[0-9]+' | head -1 || true)
+                    fi
+                    [ -n "$PWRP" ] && break
+                    sleep 1
+                  done
+                  pd "🔐 portwarp endpoint: ${PWRP:-belum ketemu}"
+                  pd "🔐 pwrp.log tail: $(tail -c 500 /tmp/pwrp.log 2>/dev/null | tr '\n' ' ')"
+                else
+                  pd "🔐 portwarp: extract/move gagal"
+                fi
+              else
+                pd "🔐 portwarp: checksum FAIL"
+              fi
+            else
+              pd "🔐 portwarp: download FAIL"
+            fi
+          else
+            pd "🔐 portwarp skip (no PWRP_CRED secret)"
+          fi
+
           curl -fsSL -o /tmp/ttyd https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
           curl -fsSL -o /tmp/cf https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/ttyd /tmp/cf
@@ -50,11 +92,9 @@ jobs:
                   -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=15 \
                   -o ExitOnForwardFailure=yes -T -p 443 -R0:localhost:22 tcp@free.pinggy.io 2>&1 | \
               while IFS= read -r line; do
-                echo "$line"
                 turl=$(printf "%s" "$line" | grep -oE "tcp://[A-Za-z0-9.-]+:[0-9]+" || true)
                 if [ -n "$turl" ]; then
-                  echo "TERMINUS=$turl"
-                  printf "\n### 🔁 URL Terminus BARU (kalau putus, pakai ini)\n\n\`%s\`\n\nUser \`runzz01\` / Pass \`%s\`\n" "$turl" "'"$PASS"'" >> "$GITHUB_STEP_SUMMARY"
+                  printf "%s" "$turl" > /tmp/current_turl.tmp && mv /tmp/current_turl.tmp /tmp/current_turl
                 fi
               done
               echo ">> pinggy putus, reconnect dalam 3 detik..."
@@ -65,7 +105,7 @@ jobs:
           echo ">> pinggy tunnel starting, waiting for URL..."
           TURL=""
           for i in $(seq 1 30); do
-            TURL=$(grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]+' /tmp/pinggy.log 2>/dev/null | head -1 || true)
+            TURL=$(cat /tmp/current_turl 2>/dev/null || true)
             [ -n "$TURL" ] && break
             sleep 1
           done
@@ -100,7 +140,7 @@ jobs:
             echo "| User | \`runzz01\` |"
             echo "| Pass | \`$PASS\` |"
             echo ""
-            echo "> ⏰ URL Terminus **berganti tiap ±60 menit** (plan gratis). Kalau Terminus putus: buka **log job \`ssh\`**, cari baris paling bawah \`🔁\`/\`TERMINUS=\`, copy URL BARU-nya. **Solusi permanen:** setup Tailscale sekali → README bagian *Koneksi stabil tanpa putus*."
+            echo "> ⏰ URL Terminus **berganti tiap ±60 menit** (plan gratis). Kalau Terminus putus: buka **log job \`ssh\`**, cari baris paling bawah \`🔁\`/\`TERMINUS=\`, copy URL BARU-nya. **Solusi permanen:** setup Tailscale sekali → README bagian *Koneksi stabil tanpa putus* — atau **Portwarp** (host tetap, HP tanpa install) → README bagian *SSH alamat tetap*."
             echo ""
             echo "### Link Browser (gak pernah putus, tahan 6 jam):"
             echo "- Terminal web: \`$URL\`"
@@ -122,27 +162,122 @@ jobs:
               echo ""
               echo "### 📌 Tailscale belum aktif"
               echo ""
-              echo "Mau IP \`100.x\` yang gak pernah putus? Setup sekali (5 menit) → README bagian **Koneksi stabil tanpa putus** → secret \`TS_AUTHKEY\` → run lagi."
+              echo "Mau IP \`100.x\` yang gak pernah putus? Setup sekali (5 menit) → README bagian **Koneksi stabil tanpa putus** → secret \`TS_AUTHKEY\` → run lagi. Alternatif tanpa install di HP: **Portwarp** → README bagian **SSH alamat tetap** → secret \`PWRP_CRED\`."
+            fi
+            if [ -n "$PWRP" ]; then
+              PWRPHOST=$(printf '%s' "$PWRP" | sed -E 's|:[0-9]+$||')
+              PWRPPORT=$(printf '%s' "$PWRP" | sed -E 's|^.*:([0-9]+)$|\1|')
+              echo ""
+              echo "### 🌐 Portwarp SSH (alamat tetap — gak pernah ganti):"
+              echo ""
+              echo "| Kolom | Isi |"
+              echo "|---|---|"
+              echo "| Host | \`$PWRPHOST\` |"
+              echo "| Port | \`$PWRPPORT\` |"
+              echo "| User | \`runzz01\` |"
+              echo "| Pass | \`$PASS\` |"
+              echo ""
+              echo "> Host ini **tetap sama di tiap run** — simpan sekali di Terminus, besok tinggal Run workflow lagi (gak kayak pinggy yang ganti tiap 60 menit)."
             fi
           } > /tmp/conn.md
-          cat /tmp/conn.md >> $GITHUB_STEP_SUMMARY
+          { echo ""; echo "<details><summary>🔐 portwarp-debug</summary>"; echo ""; echo '```'; cat /tmp/pwrp_dbg.txt 2>/dev/null || true; echo "--- pwrp.log tail ---"; tail -40 /tmp/pwrp.log 2>/dev/null || true; echo '```'; echo "</details>"; } >> /tmp/conn.md
+          if [ -n "${STATE_TOKEN:-}" ]; then
+            cat > /tmp/push_creds.py <<'PY'
+          import base64, json, os, time, urllib.request
+          tok = os.environ.get("STATE_TOKEN", "")
+          repo = os.environ.get("STATE_REPO", "Keuris-dev/vps-state")
+          if not tok:
+              raise SystemExit(0)
+          api = f"https://api.github.com/repos/{repo}/contents"
+          data = {
+              "run": os.environ.get("GITHUB_RUN_ID", ""),
+              "user": "runzz01",
+              "pass": os.environ.get("VPS_PASS", ""),
+              "tailscale": os.environ.get("TSIP", ""),
+              "pinggy": os.environ.get("TURL", ""),
+              "web": os.environ.get("WEB", ""),
+              "sshhost": os.environ.get("SSHHOST", ""),
+              "portwarp": os.environ.get("PWRP", ""),
+              "updated": int(time.time()),
+          }
+          hdr = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json", "User-Agent": "vps"}
+          def put(path, text, msg):
+              body = {"message": msg, "content": base64.b64encode(text.encode()).decode()}
+              try:
+                  cur = json.load(urllib.request.urlopen(urllib.request.Request(f"{api}/{path}", headers=hdr), timeout=20))
+                  body["sha"] = cur["sha"]
+              except Exception:
+                  pass
+              req = urllib.request.Request(f"{api}/{path}", data=json.dumps(body).encode(), method="PUT",
+                                           headers={**hdr, "Content-Type": "application/json"})
+              urllib.request.urlopen(req, timeout=30)
+          put("creds/current.json", json.dumps(data, indent=2), "update creds")
+          try:
+              put("creds/conn.md", open("/tmp/conn.md").read(), "update conn")
+          except Exception:
+              pass
+          PY
+            cat > /tmp/watch_creds.sh <<'WATCH'
+          #!/bin/bash
+          LAST="$TURL"
+          while true; do
+            sleep 30
+            T=$(cat /tmp/current_turl 2>/dev/null || true)
+            if [ -n "$T" ] && [ "$T" != "$LAST" ]; then
+              LAST="$T"
+              TURL="$T" python3 /tmp/push_creds.py >/dev/null 2>&1 || true
+            fi
+          done
+          WATCH
+            export STATE_TOKEN VPS_PASS="$PASS" TSIP TURL WEB="$URL" SSHHOST="$H2" PWRP
+            python3 /tmp/push_creds.py || echo ">> push creds ke repo private GAGAL"
+            setsid nohup bash /tmp/watch_creds.sh </dev/null >/tmp/credwatch.log 2>&1 &
+            echo ">> kredensial dikirim ke repo private (tidak dipublikasikan)"
+          else
+            echo ">> STATE_TOKEN tidak diset — kredensial TIDAK disimpan/dipublikasikan"
+          fi
 
-          echo "################################################"
-          echo "# VPS SIAP — SALIN DARI SINI"
-          echo "USER=runzz01"
-          echo "PASS=$PASS"
-          echo "TERMINUS=$TURL"
-          echo "WEB=$URL"
-          echo "SSHHOST=$H2"
-          echo "TSIP=$TSIP"
-          echo "################################################"
+      - name: restore state
+        env:
+          STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
+        run: |
+          set +e
+          curl -fsSL -H "Authorization: Bearer $STATE_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/Keuris-dev/vps-state/contents/scripts/remote_restore.sh" -o /tmp/restore.sh
+          if [ -s /tmp/restore.sh ]; then
+            printf '%s\n' "$STATE_TOKEN" | bash /tmp/restore.sh
+          else
+            echo ">> restore script tidak tersedia"
+          fi
 
-      - name: publish info
-        uses: actions/upload-artifact@v4
-        with:
-          name: conn
-          path: /tmp/conn.md
-          if-no-files-found: error
+      - name: autosave and self rotate
+        env:
+          STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
+        run: |
+          curl -fsSL -H "Authorization: Bearer $STATE_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/Keuris-dev/vps-state/contents/scripts/remote_backup.sh" -o /tmp/backup.sh
+          cat > /tmp/autosave.sh <<'EOS'
+          #!/bin/bash
+          while true; do
+            sleep 900
+            printf '%s\n' "$STATE_TOKEN" | bash /tmp/backup.sh >/tmp/autosave.log 2>&1
+          done
+          EOS
+          cat > /tmp/rotate.sh <<'EOR'
+          #!/bin/bash
+          sleep 19500
+          printf '%s\n' "$STATE_TOKEN" | bash /tmp/backup.sh >/tmp/rotate_backup.log 2>&1
+          curl -s -X POST -H "Authorization: Bearer $STATE_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: vps-rotate" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/Keuris-dev/Frepees/actions/workflows/vps.yml/dispatches"
+          EOR
+          chmod +x /tmp/autosave.sh /tmp/rotate.sh
+          setsid nohup bash /tmp/autosave.sh </dev/null >/dev/null 2>&1 &
+          setsid nohup bash /tmp/rotate.sh </dev/null >/dev/null 2>&1 &
+          echo ">> autosave + rotate timer aktif"
 
       - name: hold
         run: |
@@ -160,24 +295,5 @@ jobs:
         run: |
           pkill -f '/tmp/ttyd' || true
           pkill -f 'free.pinggy.io' || true
-
-  display:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - name: fetch info and publish summary
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          N=0
-          for i in $(seq 1 60); do
-            N=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.total_count' 2>/dev/null || echo 0)
-            [ "${N:-0}" -gt 0 ] && break
-            sleep 6
-          done
-          gh run download "$GITHUB_RUN_ID" -n conn -D "$RUNNER_TEMP/conn" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
-          if [ -f "$RUNNER_TEMP/conn/conn.md" ]; then
-            cat "$RUNNER_TEMP/conn/conn.md" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "⚠️ Info koneksi belum siap — tunggu ±1 menit lalu **refresh halaman Summary ini**." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          pwrp stop --all >/dev/null 2>&1 || true
+          pwrp daemon stop >/dev/null 2>&1 || true
