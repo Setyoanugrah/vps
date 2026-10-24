@@ -1,0 +1,85 @@
+name: sshbox
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        description: ssh public key to authorize
+        required: false
+      hours:
+        description: keep alive (hours, max 5)
+        required: false
+        default: "5"
+
+jobs:
+  box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: boot
+        run: |
+          set -e
+          sudo useradd -m -s /bin/bash runzz 2>/dev/null || true
+          R1=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          PASS="box${R1}"
+          echo "runzz:$PASS" | sudo chpasswd
+          echo 'runzz ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/runzz >/dev/null
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo mkdir -p /run/sshd
+
+          if [ -n "${{ inputs.pubkey }}" ]; then
+            sudo mkdir -p /home/runzz/.ssh
+            printf '%s\n' "${{ inputs.pubkey }}" | sudo tee /home/runzz/.ssh/authorized_keys >/dev/null
+            sudo chown -R runzz:runzz /home/runzz/.ssh
+            sudo chmod 700 /home/runzz/.ssh
+            sudo chmod 600 /home/runzz/.ssh/authorized_keys
+          fi
+          sudo /usr/sbin/sshd
+          echo ">> sshd up"
+
+          pip install -q playwright
+          python -m playwright install --with-deps chromium >/dev/null 2>&1 || true
+          echo ">> playwright ready"
+
+          curl -fsSL -o /tmp/ttyd https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
+          chmod +x /tmp/ttyd
+          setsid nohup /tmp/ttyd -p 7681 -W -c "runzz:$PASS" -u "$(id -u runzz)" -g "$(id -g runzz)" bash >/tmp/ttyd.log 2>&1 &
+          sleep 2
+
+          touch /tmp/pinggy.log
+          setsid nohup bash -c '
+            while true; do
+              ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                  -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+                  -o ExitOnForwardFailure=yes -T -p 443 -R0:localhost:22 tcp@free.pinggy.io 2>&1 | \
+              while IFS= read -r line; do
+                echo "$line"
+                turl=$(printf "%s" "$line" | grep -oE "tcp://[A-Za-z0-9.-]+:[0-9]+" || true)
+                [ -n "$turl" ] && echo "TERMINUS=$turl"
+              done
+              echo ">> pinggy putus, reconnect 3s"
+              sleep 3
+            done
+          ' </dev/null >> /tmp/pinggy.log 2>&1 &
+
+          TURL=""
+          for i in $(seq 1 40); do
+            TURL=$(grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]+' /tmp/pinggy.log 2>/dev/null | head -1 || true)
+            [ -n "$TURL" ] && break
+            sleep 2
+          done
+
+          THOST=$(printf '%s' "$TURL" | sed -E 's|^tcp://||; s|:[0-9]+$||')
+          TPORT=$(printf '%s' "$TURL" | sed -E 's|^.*:([0-9]+)$|\1|')
+
+          echo "################################################"
+          echo "# BOX SIAP"
+          echo "SSH_HOST=$THOST"
+          echo "SSH_PORT=$TPORT"
+          echo "SSH_USER=runzz"
+          echo "SSH_PASS=$PASS"
+          echo "TUNNEL=$TURL"
+          echo "################################################"
+
+          H=${{ inputs.hours }}
+          sleep $(( H * 3600 ))
